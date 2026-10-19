@@ -1,0 +1,95 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -6,6 +6,7 @@
+ from collections.abc import Iterable
+ from typing import Any
+ 
++from kv_sched.runtime import SchedulerHooks
+ from vllm.config import VllmConfig
+ from vllm.distributed.ec_transfer.ec_connector.base import (
+     ECConnectorMetadata,
+@@ -186,8 +187,10 @@
+             dcp_world_size=self.dcp_world_size,
+         )
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
++        self._kv = SchedulerHooks(self)
+ 
+     def schedule(self) -> SchedulerOutput:
++        self._kv.begin()
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+@@ -288,13 +291,21 @@
+ 
+                     # The request cannot be scheduled.
+                     # Preempt the lowest-priority request.
+-                    if self.policy == SchedulingPolicy.PRIORITY:
+-                        preempted_req = max(
+-                            self.running,
+-                            key=lambda r: (r.priority, r.arrival_time),
+-                        )
++                    if self.policy == SchedulingPolicy.PRIORITY or self._kv.config.preemption != "default":
++                        if self.policy == SchedulingPolicy.PRIORITY:
++                            preempted_req = max(
++                                self.running,
++                                key=lambda r: (r.priority, r.arrival_time),
++                            )
++                        else:
++                            preempted_req = self._kv.select(request, num_new_tokens)
++                            if preempted_req is None:
++                                break
++                        victim_index = self.running.index(preempted_req)
+                         self.running.remove(preempted_req)
+                         if preempted_req in scheduled_running_reqs:
++                            self._kv.counters["reserved_victim_rollbacks"] += 1
++                            self._kv.rollback_cache(preempted_req)
+                             scheduled_running_reqs.remove(preempted_req)
+                             token_budget += num_scheduled_tokens[
+                                 preempted_req.request_id
+@@ -315,10 +326,12 @@
+                                     for i in preempted_encoder_inputs
+                                 )
+                                 encoder_compute_budget += num_tokens_to_restore
++                        if victim_index < req_index:
+                             req_index -= 1
+                     else:
+                         preempted_req = self.running.pop()
+ 
++                    self._kv.before_preempt(preempted_req)
+                     self.kv_cache_manager.free(preempted_req)
+                     self.encoder_cache_manager.free(preempted_req)
+                     preempted_req.status = RequestStatus.PREEMPTED
+@@ -395,6 +408,8 @@
+ 
+         # Next, schedule the WAITING requests.
+         if not preempted_reqs:
++            if token_budget > 0 and len(self.running) < self.max_num_running_reqs:
++                self._kv.reorder()
+             while self.waiting and token_budget > 0:
+                 if len(self.running) == self.max_num_running_reqs:
+                     break
+@@ -578,6 +593,8 @@
+                         continue
+                     # The request cannot be scheduled.
+                     break
++
++                self._kv.admitted(request, num_new_local_computed_tokens, num_external_computed_tokens)
+ 
+                 # KVTransfer: the connector uses this info to determine
+                 # if a load is needed. Note that
+@@ -727,6 +744,7 @@
+             )
+             scheduler_output.ec_connector_metadata = ec_meta
+ 
++        self._kv.stage(scheduler_output)
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
+         return scheduler_output
+@@ -985,6 +1003,7 @@
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        self._kv.committed(scheduler_output, model_runner_output)
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

@@ -1,0 +1,11 @@
+{
+  "scope": "Shared by instrumented baseline and optimized groups; excluded from optimization attribution",
+  "local_fixes": [
+    {"name": "preserve_generated_history_after_cpu_resume", "test": "test_preempted_cpu_load_is_resumed_with_generated_history"},
+    {"name": "hold_cancelled_load_destinations_until_ack", "test": "test_aborted_cpu_load_holds_gpu_destination_until_ack"},
+    {"name": "release_after_both_transfer_directions_and_ignore_duplicate_ack", "test": "test_cancelled_request_waits_for_both_jobs_and_ignores_duplicate_ack"},
+    {"name": "keep_polling_deferred_finished_transfers", "test": "test_cancelled_request_waits_for_both_jobs_and_ignores_duplicate_ack"},
+    {"name": "advance_completed_load_holders_when_no_request_can_release_memory", "test": "test_completed_load_holders_can_advance_past_memory_blocked_head"}
+  ],
+  "note": "These entries are local compatibility corrections, not claimed as reproductions of upstream PR patches. Invalidating unexecuted KV hashes remains in the scheduler optimization patch."
+}

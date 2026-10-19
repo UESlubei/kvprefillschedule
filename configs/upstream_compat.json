@@ -1,0 +1,5 @@
+[
+  {"number":28951,"head":"62fc83123e0a0e3cb9535b49ce9d3992a05f7732","merge":"c0c2dd1e0b75c70706f4d8dbcd1d75f1c1750e14","url":"https://github.com/vllm-project/vllm/pull/28951","title":"Fix partial CPU block loading"},
+  {"number":29870,"head":"5aa68e443d78f25f0bbd8d5fc6672cc6945a0191","merge":"4c16ba617f76b342dd0e62deba1f96ed6cee74fa","url":"https://github.com/vllm-project/vllm/pull/29870","title":"Flush stores before preempted GPU blocks are overwritten"},
+  {"number":27743,"head":"a58c3760878c42ab8708f1f8f35fec8e9c5fea76","merge":"647464719b131963dccdc3a28cfe52d1af293cda","url":"https://github.com/vllm-project/vllm/pull/27743","title":"Cross-layer KV blocks; dependency context for deferred stores (no kernel backport)"}
+]

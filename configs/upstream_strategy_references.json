@@ -1,0 +1,47 @@
+{
+  "54625": {
+    "title": "[Core] Add cache-aware admission ordering",
+    "html_url": "https://github.com/vllm-project/vllm/pull/54625",
+    "state": "open",
+    "updated_at": "2026-10-08T10:10:17Z",
+    "head_sha": "a9317c9a9bd08b71316ce95c0f047aacd56105eb",
+    "base_sha": "2a537887de7a103baa49bbfdce93e99d48d19441",
+    "usage": "reference strategy, not a cherry-picked PR reproduction"
+  },
+  "56897": {
+    "title": "Add cost-aware preemption victim selection",
+    "html_url": "https://github.com/vllm-project/vllm/pull/56897",
+    "state": "open",
+    "updated_at": "2026-09-23T00:31:30Z",
+    "head_sha": "abb95bef29df444f3a26743ef198f73f0b5c11da",
+    "base_sha": "ba2ae9f23961ac67bc5c055da8c26fbd660989c6",
+    "usage": "reference strategy, not a cherry-picked PR reproduction"
+  },
+  "53723": {
+    "title": "[Core] Add default-off preemption_victim=\"lcf\" (least-computed-first) victim policy",
+    "html_url": "https://github.com/vllm-project/vllm/pull/53723",
+    "state": "open",
+    "updated_at": "2026-09-11T02:52:19Z",
+    "head_sha": "1487525b0c7a0047d83c111c88551cf7a282867c",
+    "base_sha": "9c8e90eb2637a863ca14e47fd436b10ed7ba6536",
+    "usage": "reference strategy, not a cherry-picked PR reproduction"
+  },
+  "57698": {
+    "title": "[Core][Metrics] Add exact recomputed-token counter",
+    "html_url": "https://github.com/vllm-project/vllm/pull/57698",
+    "state": "open",
+    "updated_at": "2026-10-12T21:25:58Z",
+    "head_sha": "bb1568b419a0e98f0752e47b76acb8f19e9536e9",
+    "base_sha": "ab5266769e702434a0968d47319d0731d8ccac35",
+    "usage": "reference strategy, not a cherry-picked PR reproduction"
+  },
+  "51787": {
+    "title": "[Bugfix][KV Offload] Track cache recency once per request",
+    "html_url": "https://github.com/vllm-project/vllm/pull/51787",
+    "state": "closed",
+    "updated_at": "2026-09-16T11:30:59Z",
+    "head_sha": "3938a094152ce5afb51a0f688f2cba95e9540226",
+    "base_sha": "961c5b6b7ea98b765a6d436434d18ef945596f32",
+    "usage": "reference strategy, not a cherry-picked PR reproduction"
+  }
+}

@@ -1,0 +1,270 @@
+--- a/vllm/v1/kv_offload/worker/cpu_gpu.py
++++ b/vllm/v1/kv_offload/worker/cpu_gpu.py
+@@ -135,21 +135,17 @@
+         assert src_blocks.ndim == 1
+         assert dst_blocks.ndim == 1
+ 
+-        dst_sub_blocks_to_skip = -src_blocks.size % dst_block_size_factor
+-        src_sub_block_count = src_blocks.size * src_block_size_factor
++        dst_sub_block_count = dst_blocks.size * dst_block_size_factor
++        src_sub_blocks_to_skip = -dst_blocks.size % src_block_size_factor
++        assert src_blocks.size * src_block_size_factor - src_sub_blocks_to_skip == dst_sub_block_count
+ 
+-        assert (
+-            src_sub_block_count
+-            == dst_blocks.size * dst_block_size_factor - dst_sub_blocks_to_skip
+-        )
+-
+-        src_to_dst = np.empty((src_sub_block_count, 2), dtype=np.int64)
+-        expand_block_ids(src_blocks, src_block_size_factor, src_to_dst[:, 0])
++        src_to_dst = np.empty((dst_sub_block_count, 2), dtype=np.int64)
++        expand_block_ids(src_blocks, src_block_size_factor, src_to_dst[:, 0], skip_count=src_sub_blocks_to_skip)
+         expand_block_ids(
+             dst_blocks,
+             dst_block_size_factor,
+             src_to_dst[:, 1],
+-            skip_count=dst_sub_blocks_to_skip,
++            skip_count=0,
+         )
+         src_to_dst_tensor = torch.from_numpy(src_to_dst)
+ 
+@@ -174,6 +170,12 @@
+         # success
+         return True
+ 
++    def wait(self, job_ids: set[int]) -> None:
++        for job_id in job_ids:
++            event = self.transfer_events.get(job_id)
++            if event is not None:
++                event.synchronize()
++
+     def get_finished(self) -> list[TransferResult]:
+         results: list[TransferResult] = []
+         for job_id, event in self.transfer_events.items():
+--- a/vllm/v1/kv_offload/worker/worker.py
++++ b/vllm/v1/kv_offload/worker/worker.py
+@@ -131,6 +131,10 @@
+ 
+         return success
+ 
++    def wait(self, job_ids: set[int]) -> None:
++        for handler in self.handlers:
++            handler.wait(job_ids)
++
+     def get_finished(self) -> list[TransferResult]:
+         """
+         Get transfers finished since last call.
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -187,6 +187,9 @@
+     # need to perform grammar bitmask computation.
+     pending_structured_output_tokens: bool = False
+ 
++    # Backport #29870: consumed before any freed blocks are overwritten.
++    preempted_req_ids: set[str] | None = None
++
+     # KV Cache Connector metadata.
+     kv_connector_metadata: KVConnectorMetadata | None = None
+ 
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -140,6 +140,7 @@
+         # requests so that they can free the cached states for those requests.
+         # This is flushed at the end of each scheduling step.
+         self.finished_req_ids: set[str] = set()
++        self._finished_kv_transfer_req_ids: set[str] = set()
+ 
+         # KV Connector: requests in process of async KV loading or recving
+         self.finished_recving_kv_req_ids: set[str] = set()
+@@ -404,7 +405,8 @@
+                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                     is_ready = self._update_waiting_for_remote_kv(request)
+                     if is_ready:
+-                        request.status = RequestStatus.WAITING
++                        # Preserve generated history when async CPU load resumes a preempted request.
++                        request.status = (RequestStatus.PREEMPTED if request.num_preemptions else RequestStatus.WAITING)
+                     else:
+                         logger.debug(
+                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
+@@ -559,6 +561,21 @@
+                 )
+ 
+                 if new_blocks is None:
++                    # Completed loads already own GPU blocks. If no running
++                    # request can release memory, let these holders finish
++                    # before a blocked head; otherwise the engine can deadlock.
++                    ready_holders = [r for r in self.waiting
++                        if r is not request
++                        and r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
++                        and r.request_id in self.finished_recving_kv_req_ids] if not self.running and self.connector is not None else []
++                    if ready_holders:
++                        self.waiting.remove_requests(ready_holders)
++                        for holder in reversed(ready_holders):
++                            self.waiting.prepend_request(holder)
++                        hooks = getattr(self, "_kv", None)
++                        if hooks is not None:
++                            hooks.counters["native_ready_promotions"] += len(ready_holders)
++                        continue
+                     # The request cannot be scheduled.
+                     break
+ 
+@@ -691,6 +708,8 @@
+             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+         )
+ 
++        scheduler_output.preempted_req_ids = {r.request_id for r in preempted_reqs}
++
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+         # 1. Plan the KV cache store
+         # 2. Wrap up all the KV cache load / save ops into an opaque object
+@@ -1298,7 +1317,9 @@
+         if self.finished_req_ids_dict is not None:
+             self.finished_req_ids_dict[request.client_index].add(request_id)
+ 
+-        if not delay_free_blocks:
++        if delay_free_blocks:
++            self._finished_kv_transfer_req_ids.add(request_id)
++        else:
+             self._free_blocks(request)
+ 
+         return kv_xfer_params
+@@ -1306,13 +1327,16 @@
+     def _free_blocks(self, request: Request):
+         assert request.is_finished()
+         self.kv_cache_manager.free(request)
++        self._finished_kv_transfer_req_ids.discard(request.request_id)
++        self.finished_recving_kv_req_ids.discard(request.request_id)
++        self.failed_recving_kv_req_ids.discard(request.request_id)
+         del self.requests[request.request_id]
+ 
+     def get_num_unfinished_requests(self) -> int:
+         return len(self.waiting) + len(self.running)
+ 
+     def has_finished_requests(self) -> bool:
+-        return len(self.finished_req_ids) > 0
++        return bool(self.finished_req_ids or self._finished_kv_transfer_req_ids)
+ 
+     def reset_prefix_cache(self) -> bool:
+         return self.kv_cache_manager.reset_prefix_cache()
+@@ -1469,13 +1493,20 @@
+             self.connector.update_connector_output(kv_connector_output)
+ 
+         # KV Connector:: update recv and send status from last step.
++        cs = getattr(self.connector, "connector_scheduler", None)
+         for req_id in kv_connector_output.finished_recving or ():
+-            logger.debug("Finished recving KV transfer for request %s", req_id)
+-            self.finished_recving_kv_req_ids.add(req_id)
++            request = self.requests.get(req_id)
++            if request is None:
++                continue  # Late completion after a cancelled request was released.
++            if request.is_finished():
++                if cs is None or req_id not in cs._reqs_being_stored:
++                    self._free_blocks(request)
++            else:
++                self.finished_recving_kv_req_ids.add(req_id)
+         for req_id in kv_connector_output.finished_sending or ():
+-            logger.debug("Finished sending KV transfer for request %s", req_id)
+-            assert req_id in self.requests
+-            self._free_blocks(self.requests[req_id])
++            request = self.requests.get(req_id)
++            if request is not None and (cs is None or req_id not in cs._reqs_being_loaded):
++                self._free_blocks(request)
+ 
+     def _update_requests_with_invalid_blocks(
+         self, requests: Iterable[Request], invalid_block_ids: set[int]
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+@@ -63,6 +63,12 @@
+         assert self.connector_worker is not None
+         self.connector_worker.register_kv_caches(kv_caches)
+ 
++    supports_preemption_flush = True
++
++    def handle_preemptions(self, request_ids: set[str]):
++        assert self.connector_worker is not None
++        self.connector_worker.handle_preemptions(request_ids)
++
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+         assert self.connector_worker is not None
+         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
+@@ -336,6 +342,12 @@
+             reqs_to_store=self._get_reqs_to_store(scheduler_output),
+         )
+         self._reqs_to_load = {}
++        for rid in scheduler_output.preempted_req_ids or ():
++            hashes = self._reqs_being_stored.get(rid)
++            if hashes:
++                self.manager.complete_store(hashes)
++                hashes.clear()
++            self._next_stored_block_idx.pop(rid, None)
+         return meta
+ 
+     def update_connector_output(self, connector_output: KVConnectorOutput):
+@@ -376,8 +388,9 @@
+         self._request_block_ids.pop(req_id, None)
+         self._next_stored_block_idx.pop(req_id, None)
+ 
+-        request_being_stored = req_id in self._reqs_being_stored
+-        return request_being_stored, None
++        # Both DMA source and destination remain owned until completion.
++        transfer_pending = req_id in self._reqs_being_stored or req_id in self._reqs_being_loaded
++        return transfer_pending, None
+ 
+     def take_events(self) -> Iterable[KVCacheEvent]:
+         """Take the KV cache events from the connector.
+@@ -407,6 +420,7 @@
+         self.worker = OffloadingWorker()
+ 
+         self._job_counter = 0
++        self._unsubmitted_store_jobs = []
+ 
+         # req_id -> (job_id, store)
+         self._jobs: dict[int, tuple[ReqId, bool]] = {}
+@@ -417,6 +431,16 @@
+ 
+         self._finished_reqs_waiting_for_store: set[ReqId] = set()
+ 
++    def _submit_stores(self):
++        for job_id, spec in self._unsubmitted_store_jobs:
++            assert self.worker.transfer_async(job_id, spec)
++        self._unsubmitted_store_jobs.clear()
++
++    def handle_preemptions(self, request_ids: set[str]):
++        self._submit_stores()
++        for rid in request_ids:
++            self.worker.wait(self._store_jobs.get(rid, set()))
++
+     def _generate_job_id(self) -> int:
+         job_id = self._job_counter
+         self._job_counter = job_id + 1
+@@ -427,6 +451,7 @@
+             self.worker.register_handler(src_cls, dst_cls, handler)
+ 
+     def start_load_kv(self, metadata: OffloadingConnectorMetadata):
++        self._submit_stores()
+         for req_id, transfer_spec in metadata.reqs_to_load.items():
+             job_id = self._generate_job_id()
+             self._jobs[job_id] = (req_id, False)
+@@ -439,7 +464,7 @@
+             job_id = self._generate_job_id()
+             self._jobs[job_id] = (req_id, True)
+             self._store_jobs[req_id].add(job_id)
+-            assert self.worker.transfer_async(job_id, transfer_spec)
++            self._unsubmitted_store_jobs.append((job_id, transfer_spec))
+ 
+     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+         """
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -2652,6 +2652,11 @@
+         ):
+             scheduler_output = deepcopy(scheduler_output)
+ 
++        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
++            connector = get_kv_transfer_group()
++            if hasattr(connector, "handle_preemptions"):
++                connector.handle_preemptions(scheduler_output.preempted_req_ids)
++
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
+             with self.synchronize_input_prep():
